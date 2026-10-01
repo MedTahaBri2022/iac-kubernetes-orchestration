@@ -1,0 +1,15 @@
+{
+  "name": "platform-demo-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-dependency HTTP service used to observe scaling and rolling updates",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

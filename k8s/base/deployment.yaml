@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5 # how many ReplicaSets are kept for rollbacks
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1 # one extra pod at a time
+      maxUnavailable: 0 # never go below the desired capacity
+  minReadySeconds: 5 # a new pod must stay ready this long before the next one is replaced
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-app
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: platform-demo-app:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          # Non-sensitive settings: every key of the ConfigMap becomes a variable.
+          envFrom:
+            - configMapRef:
+                name: demo-app-config
+          # Sensitive setting: a single key of the Secret.
+          env:
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-app-secrets
+                  key: API_TOKEN
+          # Requests are what the scheduler reserves and what the autoscaler
+          # measures against; limits are the hard ceiling.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

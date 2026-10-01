@@ -1,0 +1,13 @@
+# Terraform: providers, state and real variable values never go to git.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+kubeconfig*.yaml
+node_modules/
+.env
+.DS_Store
+.vscode/
+.idea/

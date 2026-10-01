@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - hpa.yaml
+
+namespace: platform-demo
+
+# Once the autoscaler owns the replica count, the Deployment must stop
+# declaring one: otherwise every `kubectl apply` would reset it.
+patches:
+  - target:
+      kind: Deployment
+      name: demo-app
+    patch: |-
+      - op: remove
+        path: /spec/replicas

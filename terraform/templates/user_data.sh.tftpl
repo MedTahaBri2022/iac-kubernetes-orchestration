@@ -1,0 +1,22 @@
+#!/bin/bash
+# First-boot provisioning of the Kubernetes node (rendered by Terraform).
+set -euo pipefail
+
+# IMDSv2: ask for a session token, then read the public IP.
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# k3s bundles the control plane, containerd and metrics-server. The public IP
+# is added to the API certificate so kubectl can connect from outside.
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_VERSION="${k3s_version}" \
+  sh -s - server \
+    --tls-san "$PUBLIC_IP" \
+    --write-kubeconfig-mode 0640 \
+    --disable traefik
+
+# Let the default user run kubectl without sudo.
+chgrp ubuntu /etc/rancher/k3s/k3s.yaml
+echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' > /etc/profile.d/k3s.sh

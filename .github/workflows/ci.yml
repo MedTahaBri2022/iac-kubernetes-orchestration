@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    name: Application tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  terraform:
+    name: Terraform (validate + apply on an AWS emulator)
+    runs-on: ubuntu-latest
+    services:
+      moto:
+        image: motoserver/moto:5.1.4
+        ports:
+          - 5000:5000
+    env:
+      # Placeholder credentials: the emulator accepts anything.
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      TF_IN_AUTOMATION: 'true'
+      TF_VAR_emulator_endpoint: http://localhost:5000
+      TF_VAR_admin_cidr: 203.0.113.7/32
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+      - name: The admin CIDR cannot be the whole internet
+        run: |
+          if TF_VAR_admin_cidr=0.0.0.0/0 terraform plan -input=false; then
+            echo "plan should have been rejected" && exit 1
+          fi
+      - name: Pick an AMI and a key the emulator knows
+        run: |
+          ami=$(curl -s "http://localhost:5000/?Action=DescribeImages&Version=2016-11-15&Owner.1=099720109477" \
+            -H "Authorization: AWS4-HMAC-SHA256 Credential=testing/20260101/eu-west-3/ec2/aws4_request" \
+            | grep -o 'ami-[0-9a-f]*' | head -1)
+          test -n "$ami"
+          ssh-keygen -q -t ed25519 -N "" -f "$RUNNER_TEMP/key"
+          echo "TF_VAR_ami_id=$ami" >> "$GITHUB_ENV"
+          echo "TF_VAR_ssh_public_key=$(cat "$RUNNER_TEMP/key.pub")" >> "$GITHUB_ENV"
+      - run: terraform apply -auto-approve -input=false
+      - name: Twelve resources exist
+        run: test "$(terraform state list | grep -vc '^data\.')" -eq 12
+      - run: terraform destroy -auto-approve -input=false
+
+  kubernetes:
+    name: Kubernetes (deploy, scale, rolling update on kind)
+    runs-on: ubuntu-latest
+    env:
+      NS: platform-demo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build both versions of the image
+        run: |
+          docker build --build-arg APP_VERSION=1.0.0 -t platform-demo-app:1.0.0 app
+          docker build --build-arg APP_VERSION=1.1.0 -t platform-demo-app:1.1.0 app
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+          config: .github/kind-config.yaml
+      - run: kind load docker-image --name ci platform-demo-app:1.0.0 platform-demo-app:1.1.0
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/base/namespace.yaml
+          kubectl -n $NS create secret generic demo-app-secrets \
+            --from-literal=API_TOKEN="$(openssl rand -hex 24)"
+          kubectl apply -k k8s/base
+          kubectl -n $NS rollout status deploy/demo-app --timeout=180s
+          curl -sf localhost:30080/ | grep '"version":"1.0.0"'
+          curl -sf localhost:30080/ | grep '"secretConfigured":true'
+      - name: Scale
+        run: |
+          kubectl -n $NS scale deploy/demo-app --replicas=5
+          kubectl -n $NS rollout status deploy/demo-app --timeout=180s
+          test "$(kubectl -n $NS get deploy demo-app -o jsonpath='{.status.readyReplicas}')" -eq 5
+      - name: Rolling update without a failed request
+        run: |
+          scripts/watch-rollout.sh http://localhost:30080 60 > rollout.txt &
+          watcher=$!
+          sleep 3
+          kubectl -n $NS set image deploy/demo-app app=platform-demo-app:1.1.0
+          kubectl -n $NS rollout status deploy/demo-app --timeout=180s
+          wait $watcher
+          cat rollout.txt
+          grep -q "version 1.1.0" rollout.txt
+      - name: Roll back
+        run: |
+          kubectl -n $NS rollout undo deploy/demo-app
+          kubectl -n $NS rollout status deploy/demo-app --timeout=180s
+          curl -sf localhost:30080/ | grep '"version":"1.0.0"'
+      - name: The autoscaling overlay is accepted by the API server
+        run: kubectl apply -k k8s/overlays/autoscaling --dry-run=server
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n $NS get all
+          kubectl -n $NS get events --sort-by=.lastTimestamp | tail -30
