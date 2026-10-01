@@ -1,0 +1,25 @@
+route:
+  receiver: default
+  group_by: [alertname]
+  group_wait: 10s        # short, to make a demo observable; 30s is more usual
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: default
+      repeat_interval: 1h
+
+# While a service is completely down, its secondary alerts add no information.
+inhibit_rules:
+  - source_matchers: ['alertname="DemoAppDown"']
+    target_matchers: ['alertname=~"DemoAppReplicasLow|DemoAppHighLatency|DemoAppHighErrorRate"']
+
+receivers:
+  # No notification channel is configured in this repository: alerts are
+  # visible in Alertmanager and Grafana. To notify a team, add for example:
+  #
+  #   slack_configs:
+  #     - api_url_file: /etc/alertmanager/secrets/slack-webhook
+  #       channel: '#alerts'
+  #       send_resolved: true
+  - name: default

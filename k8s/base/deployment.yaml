@@ -18,6 +18,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: demo-app
+      # Opt-in for Prometheus (see k8s/monitoring/config/prometheus.yml).
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       terminationGracePeriodSeconds: 30
       securityContext:

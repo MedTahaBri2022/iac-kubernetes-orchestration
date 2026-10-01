@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+resources:
+  - namespace.yaml
+  - prometheus.yaml
+  - alertmanager.yaml
+  - grafana.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: monitoring
+
+# Configuration is kept as plain files next to the manifests. Each ConfigMap
+# gets a content hash in its name: changing a scrape rule, an alert or a
+# dashboard rolls the component that uses it.
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=config/prometheus.yml
+      - alerts.yml=config/alerts.yml
+  - name: alertmanager-config
+    files:
+      - alertmanager.yml=config/alertmanager.yml
+  - name: grafana-datasources
+    files:
+      - datasources.yml=config/grafana-datasources.yml
+  - name: grafana-dashboard-provider
+    files:
+      - provider.yml=config/grafana-dashboards.yml
+  - name: grafana-dashboards
+    files:
+      - demo-app.json=config/dashboard-demo-app.json

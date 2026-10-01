@@ -65,6 +65,26 @@ jobs:
         run: test "$(terraform state list | grep -vc '^data\.')" -eq 12
       - run: terraform destroy -auto-approve -input=false
 
+  monitoring:
+    name: Monitoring configuration and alert rule tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Manifests build
+        run: kubectl kustomize k8s/monitoring > /dev/null
+      - name: Prometheus configuration and rules are valid
+        run: |
+          docker run --rm -v "$PWD/k8s/monitoring/config:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.1.0 check config --syntax-only /etc/prometheus/prometheus.yml
+          docker run --rm -v "$PWD/k8s/monitoring/config:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.1.0 check rules /etc/prometheus/alerts.yml
+      - name: Alert rules fire when they should (unit tests)
+        run: |
+          docker run --rm -v "$PWD/k8s/monitoring/config:/etc/prometheus:ro" --entrypoint promtool prom/prometheus:v3.1.0 test rules /etc/prometheus/alerts.test.yml
+      - name: Alertmanager configuration is valid
+        run: |
+          docker run --rm -v "$PWD/k8s/monitoring/config:/cfg:ro" --entrypoint amtool prom/alertmanager:v0.28.0 check-config /cfg/alertmanager.yml
+      - name: The dashboard is valid JSON
+        run: jq -e '.panels | length > 0' k8s/monitoring/config/dashboard-demo-app.json
+
   kubernetes:
     name: Kubernetes (deploy, scale, rolling update on kind)
     runs-on: ubuntu-latest

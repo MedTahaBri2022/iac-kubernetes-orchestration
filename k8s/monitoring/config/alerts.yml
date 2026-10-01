@@ -1,0 +1,78 @@
+groups:
+  - name: demo-app
+    rules:
+      # Symptom-based alerts: they describe what a user experiences.
+
+      - alert: DemoAppDown
+        expr: absent(up{app="demo-app"} == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: No healthy demo-app pod
+          description: Prometheus cannot scrape a single demo-app pod. The service is down.
+          runbook: docs/observability.md#demoappdown
+
+      - alert: DemoAppHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{app="demo-app", status=~"5.."}[2m]))
+            /
+          sum(rate(http_requests_total{app="demo-app", route!~"/healthz|/readyz|/metrics"}[2m]))
+            > 0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5% of requests fail
+          description: '{{ $value | humanizePercentage }} of demo-app requests returned a 5xx over the last 2 minutes.'
+          runbook: docs/observability.md#demoapphigherrorrate
+
+      - alert: DemoAppHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{app="demo-app"}[2m]))
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: 95th percentile latency above 500 ms
+          description: 'p95 latency is {{ $value | humanizeDuration }}.'
+          runbook: docs/observability.md#demoapphighlatency
+
+      # Cause-based alerts: early warnings before users notice.
+
+      - alert: DemoAppReplicasLow
+        expr: count(up{app="demo-app"} == 1) < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Fewer than 3 healthy replicas
+          description: 'Only {{ $value }} demo-app pod(s) are being scraped successfully.'
+          runbook: docs/observability.md#demoappreplicaslow
+
+      - alert: DemoAppMemoryNearLimit
+        # The container limit is 128Mi (k8s/base/deployment.yaml).
+        expr: container_memory_working_set_bytes{namespace="platform-demo", container="app"} > 0.85 * 128 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pod memory above 85% of its limit
+          description: '{{ $labels.pod }} uses {{ $value | humanize1024 }}B of its 128Mi limit and may be OOM-killed.'
+          runbook: docs/observability.md#demoappmemorynearlimit
+
+      - alert: DemoAppCpuThrottled
+        expr: |
+          sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace="platform-demo", container="app"}[5m]))
+            /
+          sum by (pod) (rate(container_cpu_cfs_periods_total{namespace="platform-demo", container="app"}[5m]))
+            > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pod CPU throttled more than 25% of the time
+          description: '{{ $labels.pod }} is hitting its CPU limit; latency will suffer before the autoscaler reacts.'
+          runbook: docs/observability.md#demoappcputhrottled

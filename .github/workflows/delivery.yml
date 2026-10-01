@@ -1,0 +1,167 @@
+name: Delivery
+
+# Build once, deploy the exact same image everywhere.
+#
+#   build  ->  staging (throwaway cluster, automatic)  ->  production (manual approval)
+#
+# "Staging" is a kind cluster created inside the workflow: the image that was
+# just pushed is deployed with the real manifests, smoke-tested, observed by
+# the monitoring stack, and only then offered to production.
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', 'k8s/**', '.github/workflows/delivery.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: delivery
+  cancel-in-progress: false   # never interrupt a deployment half-way
+
+env:
+  NS: platform-demo
+
+jobs:
+  build:
+    name: Build and push the image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test before building
+        working-directory: app
+        run: npm test
+      - id: meta
+        name: Image name (immutable tag = commit)
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/platform-demo-app:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          docker build --build-arg APP_VERSION="${GITHUB_SHA::12}" -t "${{ steps.meta.outputs.image }}" app
+          docker push "${{ steps.meta.outputs.image }}"
+
+  staging:
+    name: Deploy to staging and verify
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: staging
+          config: .github/kind-config.yaml
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Make the pushed image available to the cluster
+        run: |
+          docker pull "$IMAGE"
+          kind load docker-image --name staging "$IMAGE"
+
+      - name: Deploy the release
+        run: |
+          # An overlay generated for this release: same manifests, new image.
+          mkdir -p k8s/overlays/release
+          cat > k8s/overlays/release/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - ../../base
+          images:
+            - name: platform-demo-app
+              newName: ${IMAGE%:*}
+              newTag: ${IMAGE##*:}
+          EOF
+          kubectl apply -f k8s/base/namespace.yaml
+          kubectl -n $NS create secret generic demo-app-secrets \
+            --from-literal=API_TOKEN="$(openssl rand -hex 24)"
+          kubectl apply -k k8s/overlays/release
+          kubectl -n $NS rollout status deploy/demo-app --timeout=180s
+
+      - name: Smoke test
+        run: |
+          curl -sf localhost:30080/ | tee response.json
+          grep -q "\"version\":\"${GITHUB_SHA::12}\"" response.json
+          curl -sf localhost:30080/metrics | grep -q '^http_requests_total'
+
+      - name: Deploy the monitoring stack
+        run: |
+          kubectl apply -f k8s/monitoring/namespace.yaml
+          kubectl -n monitoring create secret generic grafana-admin \
+            --from-literal=password="$(openssl rand -hex 16)"
+          kubectl apply -k k8s/monitoring
+          for name in prometheus alertmanager grafana; do
+            kubectl -n monitoring rollout status deploy/$name --timeout=240s
+          done
+
+      - name: Prometheus scrapes the three pods and loaded the alert rules
+        run: |
+          kubectl -n monitoring port-forward svc/prometheus 9090:9090 >/dev/null 2>&1 &
+          for attempt in $(seq 1 30); do
+            up=$(curl -s --get localhost:9090/api/v1/query \
+              --data-urlencode 'query=count(up{app="demo-app"} == 1)' \
+              | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo 0)
+            [ "$up" = "3" ] && break
+            sleep 5
+          done
+          echo "healthy demo-app targets: $up"
+          test "$up" = "3"
+          rules=$(curl -s localhost:9090/api/v1/rules | jq '[.data.groups[].rules[]] | length')
+          echo "alert rules loaded: $rules"
+          test "$rules" -ge 6
+
+      - name: Grafana serves the provisioned dashboard
+        run: |
+          kubectl -n monitoring port-forward svc/grafana 3000:3000 >/dev/null 2>&1 &
+          sleep 5
+          password=$(kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d)
+          curl -sf -u "admin:$password" localhost:3000/api/dashboards/uid/demo-app | jq -r '.dashboard.title'
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl -n $NS get events --sort-by=.lastTimestamp | tail -20
+          kubectl -n monitoring get events --sort-by=.lastTimestamp | tail -20
+
+  production:
+    name: Deploy to production
+    needs: [build, staging]
+    # Disabled until a real cluster exists: set the repository variable
+    # PRODUCTION_ENABLED=true and the secret KUBE_CONFIG, and protect the
+    # "production" environment with required reviewers for a manual approval.
+    if: ${{ vars.PRODUCTION_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cluster credentials
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+      - name: Rolling update
+        run: |
+          kubectl -n $NS set image deploy/demo-app app="$IMAGE"
+          if ! kubectl -n $NS rollout status deploy/demo-app --timeout=180s; then
+            # A release that does not become ready is rolled back automatically.
+            kubectl -n $NS rollout undo deploy/demo-app
+            exit 1
+          fi

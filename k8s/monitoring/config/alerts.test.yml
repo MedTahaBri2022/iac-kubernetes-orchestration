@@ -1,0 +1,138 @@
+# Unit tests of the alert rules, run by `promtool test rules` in CI.
+# They answer "does this rule fire when it should, and stay quiet otherwise?"
+# without a cluster.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # 30% of requests fail for five minutes.
+  - interval: 15s
+    input_series:
+      - series: 'http_requests_total{app="demo-app", route="/", status="200"}'
+        values: '0+7x20'
+      - series: 'http_requests_total{app="demo-app", route="/fail", status="500"}'
+        values: '0+3x20'
+      - series: 'up{app="demo-app", pod="a"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="b"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="c"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DemoAppHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: More than 5% of requests fail
+              description: 30% of demo-app requests returned a 5xx over the last 2 minutes.
+              runbook: docs/observability.md#demoapphigherrorrate
+      - eval_time: 5m
+        alertname: DemoAppReplicasLow
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: DemoAppDown
+        exp_alerts: []
+
+  # Health probes and scrapes must not dilute the error ratio: 1 failure out
+  # of 2 real requests is 50%, whatever the volume of /healthz calls.
+  - interval: 15s
+    input_series:
+      - series: 'http_requests_total{app="demo-app", route="/", status="200"}'
+        values: '0+1x20'
+      - series: 'http_requests_total{app="demo-app", route="/fail", status="500"}'
+        values: '0+1x20'
+      - series: 'http_requests_total{app="demo-app", route="/healthz", status="200"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DemoAppHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: More than 5% of requests fail
+              description: 50% of demo-app requests returned a 5xx over the last 2 minutes.
+              runbook: docs/observability.md#demoapphigherrorrate
+
+  # Healthy traffic: nothing fires.
+  - interval: 15s
+    input_series:
+      - series: 'http_requests_total{app="demo-app", route="/", status="200"}'
+        values: '0+10x20'
+      - series: 'up{app="demo-app", pod="a"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="b"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="c"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DemoAppHighErrorRate
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: DemoAppReplicasLow
+        exp_alerts: []
+
+  # Two pods out of three for more than two minutes.
+  - interval: 15s
+    input_series:
+      - series: 'up{app="demo-app", pod="a"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="b"}'
+        values: '1x20'
+      - series: 'up{app="demo-app", pod="c"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: DemoAppReplicasLow
+        exp_alerts: []   # still pending: a restart must not page anyone
+      - eval_time: 3m
+        alertname: DemoAppReplicasLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Fewer than 3 healthy replicas
+              description: Only 2 demo-app pod(s) are being scraped successfully.
+              runbook: docs/observability.md#demoappreplicaslow
+
+  # Every pod is gone.
+  - interval: 15s
+    input_series:
+      - series: 'up{app="demo-app", pod="a"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DemoAppDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: No healthy demo-app pod
+              description: Prometheus cannot scrape a single demo-app pod. The service is down.
+              runbook: docs/observability.md#demoappdown
+
+  # A pod close to its 128Mi limit for more than five minutes.
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="platform-demo", container="app", pod="a"}'
+        values: '120000000x10'
+      - series: 'container_memory_working_set_bytes{namespace="platform-demo", container="app", pod="b"}'
+        values: '14000000x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: DemoAppMemoryNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: platform-demo
+              container: app
+              pod: a
+            exp_annotations:
+              summary: Pod memory above 85% of its limit
+              description: a uses 114.4MiB of its 128Mi limit and may be OOM-killed.
+              runbook: docs/observability.md#demoappmemorynearlimit

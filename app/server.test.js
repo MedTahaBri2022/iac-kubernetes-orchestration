@@ -39,10 +39,29 @@ test('readiness fails while draining, liveness does not', async () => {
   }
 });
 
-test('exposes Prometheus-style metrics', async () => {
+test('exposes request metrics by route and status', async () => {
+  await fetch(`${base}/`);
+  await fetch(`${base}/fail`);
   const text = await (await fetch(`${base}/metrics`)).text();
-  assert.match(text, /^app_requests_total \d+$/m);
+
+  assert.match(text, /^http_requests_total\{route="\/",status="200"\} \d+$/m);
+  assert.match(text, /^http_requests_total\{route="\/fail",status="500"\} 1$/m);
+  assert.match(text, /^http_request_duration_seconds_bucket\{le="\+Inf"\} \d+$/m);
+  assert.match(text, /^app_info\{version="dev"\} 1$/m);
   assert.match(text, /^app_memory_rss_bytes \d+$/m);
+});
+
+test('unknown paths share one label value', async () => {
+  await fetch(`${base}/random-${Date.now()}`);
+  await fetch(`${base}/another-${Date.now()}`);
+  const text = await (await fetch(`${base}/metrics`)).text();
+
+  assert.match(text, /^http_requests_total\{route="other",status="404"\} \d+$/m);
+  assert.doesNotMatch(text, /route="\/random/);
+});
+
+test('the simulated failure answers 500', async () => {
+  assert.equal((await fetch(`${base}/fail`)).status, 500);
 });
 
 test('caps the CPU burn so one request cannot hang a pod', async () => {

@@ -19,7 +19,29 @@ const config = {
   shutdownDelayMs: Number(process.env.SHUTDOWN_DELAY_MS ?? 5000),
 };
 
-const state = { ready: true, requests: 0, startedAt: Date.now() };
+const state = { ready: true, startedAt: Date.now() };
+
+// Request metrics in the Prometheus text format, kept by hand to stay
+// dependency-free. Only known routes become label values: an attacker
+// requesting random paths cannot create unbounded time series.
+const ROUTES = ['/', '/work', '/fail', '/healthz', '/readyz', '/metrics'];
+const BUCKETS = [0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5];
+const requests = new Map(); // "route|status" -> count
+const duration = { buckets: BUCKETS.map(() => 0), sum: 0, count: 0 };
+
+function observe(pathname, status, seconds) {
+  const route = ROUTES.includes(pathname) ? pathname : 'other';
+  const key = `${route}|${status}`;
+  requests.set(key, (requests.get(key) ?? 0) + 1);
+  // Probes and scrapes would drown the latency of real traffic.
+  if (route === '/' || route === '/work' || route === '/fail') {
+    BUCKETS.forEach((limit, index) => {
+      if (seconds <= limit) duration.buckets[index]++;
+    });
+    duration.sum += seconds;
+    duration.count++;
+  }
+}
 
 /** Burns CPU for `ms` milliseconds: gives the autoscaler something to react to. */
 function burnCpu(ms) {
@@ -31,10 +53,28 @@ function burnCpu(ms) {
 
 function metrics() {
   const uptime = (Date.now() - state.startedAt) / 1000;
-  return [
-    '# HELP app_requests_total Requests served by this pod.',
-    '# TYPE app_requests_total counter',
-    `app_requests_total ${state.requests}`,
+  const lines = [
+    '# HELP http_requests_total Requests served, by route and status code.',
+    '# TYPE http_requests_total counter',
+  ];
+  for (const [key, count] of requests) {
+    const [route, status] = key.split('|');
+    lines.push(`http_requests_total{route="${route}",status="${status}"} ${count}`);
+  }
+  lines.push(
+    '# HELP http_request_duration_seconds Latency of application requests.',
+    '# TYPE http_request_duration_seconds histogram',
+  );
+  BUCKETS.forEach((limit, index) => {
+    lines.push(`http_request_duration_seconds_bucket{le="${limit}"} ${duration.buckets[index]}`);
+  });
+  lines.push(
+    `http_request_duration_seconds_bucket{le="+Inf"} ${duration.count}`,
+    `http_request_duration_seconds_sum ${duration.sum.toFixed(6)}`,
+    `http_request_duration_seconds_count ${duration.count}`,
+    '# HELP app_info Version of the running build.',
+    '# TYPE app_info gauge',
+    `app_info{version="${config.version}"} 1`,
     '# HELP app_uptime_seconds Seconds since the process started.',
     '# TYPE app_uptime_seconds gauge',
     `app_uptime_seconds ${uptime.toFixed(0)}`,
@@ -42,7 +82,8 @@ function metrics() {
     '# TYPE app_memory_rss_bytes gauge',
     `app_memory_rss_bytes ${process.memoryUsage().rss}`,
     '',
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 function route(url) {
@@ -73,6 +114,9 @@ function route(url) {
       burnCpu(ms);
       return { body: { burnedMs: ms, pod: os.hostname() } };
     }
+    // Always fails: lets the error-rate alert be exercised on purpose.
+    case '/fail':
+      return { status: 500, body: { error: 'Simulated failure' } };
     default:
       return { status: 404, body: { error: 'Not found' } };
   }
@@ -80,9 +124,10 @@ function route(url) {
 
 function createServer() {
   return http.createServer((request, response) => {
+    const startedAt = process.hrtime.bigint();
     const url = new URL(request.url, 'http://localhost');
     const { status = 200, body, text } = route(url);
-    if (url.pathname === '/' || url.pathname === '/work') state.requests++;
+    observe(url.pathname, status, Number(process.hrtime.bigint() - startedAt) / 1e9);
 
     response.writeHead(status, {
       'Content-Type': text ? 'text/plain; version=0.0.4' : 'application/json',
